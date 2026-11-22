@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
 """
-GameSir G8 Plus Firmware 2.20 Touchpad Mod
-------------------------------------------
+GameSir G8 Plus Firmware 2.20 Touchpad Mod (v2)
+-----------------------------------------------
 Patches the GameSir G8 Plus v2.20 Bluetooth firmware so that pressing
-the Capture button (under D-Pad) acts as the DualShock 4 Touchpad Click
-(Button 14) in PS4 / DualShock 4 wireless mode across all connections
-(Standard Android HID Bluetooth, Extended Bluetooth Report 17, and USB).
+the Capture button (under D-Pad on the left) acts as the DualShock 4
+Touchpad Click (Button 14) and triggers active touch contact (X=960, Y=470)
+in PS4 / DualShock 4 wireless mode across iOS (PS Remote Play), Android, and PC.
+
+Patches applied:
+  1. Patch A (VA 0x01E03690, 34 bytes):
+     Checks bits 5, 6, 7 of r10 (Capture, M, paddles) and sets Report Byte 6 bit 1
+     (Touchpad Click) + bit 0 (Home/PS) + counter << 2.
+  2. Patch B (VA 0x01E03758, 30 bytes):
+     Branches to active touch handler (0x01E03776) if any of (r10 & 0xE0) != 0.
+     Includes optimized inactive touch block.
+  3. Patch C (VA 0x01E037A8, 12 bytes):
+     Sets center touch coordinates: X=960 (0x3C0), Y=470 (0x1D6).
+  4. Patch D (VA 0x01E11176, 2 bytes):
+     Sets r0 = 1 in Report 1 handler for standard HID connections.
 
 Author: Hieu Tran & Antigravity
 """
@@ -38,8 +50,6 @@ def patch_firmware(ota_input_path: Path, output_zip_path: Path):
     dec = bytearray(cipher.cipher_bytes(cipher.jl_sfc_cipher, ota_data, 0, SFC_KEY))
 
     # 2. Parse JLFS2 Entries
-    # Entry 0: app_area_head (0x00..0x20)
-    # Entry 1: app.bin        (0x20..0x40)
     head_entry = dec[0x00:0x20]
     head_hdr_crc, head_data_crc, head_addr, head_size = struct.unpack('<HHII', head_entry[:12])
     print(f"[*] app_area_head: addr=0x{head_addr:08x}, size={head_size}, data_crc=0x{head_data_crc:04x}")
@@ -52,38 +62,60 @@ def patch_firmware(ota_input_path: Path, output_zip_path: Path):
     app_bin = bytearray(dec[app_addr : app_addr + app_size])
     assert jl_crc16(app_bin) == app_data_crc, "Original app.bin CRC mismatch!"
 
-    # 3. Apply Patches
+    # 3. Apply Precision Patches
     print("[*] Applying precision patches to app.bin...")
 
-    # Patch 1: Remove condition 'if (r8 != 0)' at 0x01e03690 (offset 0x35d0 in app.bin)
-    # Original: b8 e8 00 40 (if (r8 != 0) {)
-    # Patched:  00 00 00 00 (nop; nop)
-    # Effect: Touchpad Click (Capture bit) & PS button (Home bit) are written to report byte 6 unconditionally
-    patch1_offset = 0x01E03690 - BASE_ADDR  # 0x35d0
-    patch1_orig = bytes([0xB8, 0xE8, 0x00, 0x40])
-    patch1_new = bytes([0x00, 0x00, 0x00, 0x00])
+    # Patch A: Report Byte 6 Touchpad Click + Home/PS (34 bytes at VA 0x01E03690 / offset 0x35D0)
+    # Original: b8e80040588152ee9e08c0e1a40863e10200431960e10100301943e0a703d8ee2103
+    # Patched:  588152ee9e08c0e1a40863e10e0003414322431960e10100301943e0a703d8ee2103
+    patch_a_offset = 0x01E03690 - BASE_ADDR  # 0x35D0
+    patch_a_orig = bytes.fromhex("b8e80040588152ee9e08c0e1a40863e10200431960e10100301943e0a703d8ee2103")
+    patch_a_new = bytes.fromhex("588152ee9e08c0e1a40863e10e0003414322431960e10100301943e0a703d8ee2103")
 
-    assert app_bin[patch1_offset : patch1_offset + 4] == patch1_orig, (
-        f"Patch 1 target mismatch at 0x{patch1_offset:x}: "
-        f"found {app_bin[patch1_offset:patch1_offset+4].hex()}, expected {patch1_orig.hex()}"
+    assert app_bin[patch_a_offset : patch_a_offset + len(patch_a_orig)] == patch_a_orig, (
+        f"Patch A target mismatch at 0x{patch_a_offset:x}"
     )
-    app_bin[patch1_offset : patch1_offset + 4] = patch1_new
-    print(f"  [+] Patch 1 applied at VA 0x01E03690 (offset 0x{patch1_offset:x}): NOP out 'if (r8 != 0)'")
+    app_bin[patch_a_offset : patch_a_offset + len(patch_a_new)] = patch_a_new
+    print(f"  [+] Patch A applied at VA 0x01E03690 (offset 0x{patch_a_offset:x}): Byte 6 Touchpad Click on r10 & 0xE0")
 
-    # Patch 2: Set r0 = 1 instead of r0 = 0 before calling report generator in Report 1 handler
-    # At 0x01E11176 (offset 0x110b6 in app.bin)
-    # Original: 40 20 (r0 = 0)
-    # Patched:  40 21 (r0 = 1)
-    patch2_offset = 0x01E11176 - BASE_ADDR  # 0x110b6
-    patch2_orig = bytes([0x40, 0x20])
-    patch2_new = bytes([0x40, 0x21])
+    # Patch B: Active Touch Branch on r10 & 0xE0 (30 bytes at VA 0x01E03758 / offset 0x3698)
+    # Original: 5ae80d2a70e1011091165aee1f0843f080ff18413019984152ee2009049f
+    # Patched:  61ffe0a00f0070e1011091165aee1f0818413027984152ee20090000049f
+    patch_b_offset = 0x01E03758 - BASE_ADDR  # 0x3698
+    patch_b_orig = bytes.fromhex("5ae80d2a70e1011091165aee1f0843f080ff18413019984152ee2009049f")
+    patch_b_new = bytes.fromhex("61ffe0a00f0070e1011091165aee1f0818413027984152ee20090000049f")
 
-    assert app_bin[patch2_offset : patch2_offset + 2] == patch2_orig, (
-        f"Patch 2 target mismatch at 0x{patch2_offset:x}: "
-        f"found {app_bin[patch2_offset:patch2_offset+2].hex()}, expected {patch2_orig.hex()}"
+    assert app_bin[patch_b_offset : patch_b_offset + len(patch_b_orig)] == patch_b_orig, (
+        f"Patch B target mismatch at 0x{patch_b_offset:x}"
     )
-    app_bin[patch2_offset : patch2_offset + 2] = patch2_new
-    print(f"  [+] Patch 2 applied at VA 0x01E11176 (offset 0x{patch2_offset:x}): Set r0 = 1")
+    app_bin[patch_b_offset : patch_b_offset + len(patch_b_new)] = patch_b_new
+    print(f"  [+] Patch B applied at VA 0x01E03758 (offset 0x{patch_b_offset:x}): Branch to active touch on r10 & 0xE0")
+
+    # Patch C: Center Touchpad Coordinates (12 bytes at VA 0x01E037A8 / offset 0x36E8)
+    # Original: 5b3f9b4173309b42432a9b43 (X=127, Y=173)
+    # Patched:  73209b415b239b42433d9b43 (X=960, Y=470)
+    patch_c_offset = 0x01E037A8 - BASE_ADDR  # 0x36E8
+    patch_c_orig = bytes.fromhex("5b3f9b4173309b42432a9b43")
+    patch_c_new = bytes.fromhex("73209b415b239b42433d9b43")
+
+    assert app_bin[patch_c_offset : patch_c_offset + len(patch_c_orig)] == patch_c_orig, (
+        f"Patch C target mismatch at 0x{patch_c_offset:x}"
+    )
+    app_bin[patch_c_offset : patch_c_offset + len(patch_c_new)] = patch_c_new
+    print(f"  [+] Patch C applied at VA 0x01E037A8 (offset 0x{patch_c_offset:x}): Center coordinates X=960, Y=470")
+
+    # Patch D: Set r0 = 1 in Report 1 handler (2 bytes at VA 0x01E11176 / offset 0x110B6)
+    # Original: 4020 (r0 = 0)
+    # Patched:  4021 (r0 = 1)
+    patch_d_offset = 0x01E11176 - BASE_ADDR  # 0x110B6
+    patch_d_orig = bytes.fromhex("4020")
+    patch_d_new = bytes.fromhex("4021")
+
+    assert app_bin[patch_d_offset : patch_d_offset + len(patch_d_orig)] == patch_d_orig, (
+        f"Patch D target mismatch at 0x{patch_d_offset:x}"
+    )
+    app_bin[patch_d_offset : patch_d_offset + len(patch_d_new)] = patch_d_new
+    print(f"  [+] Patch D applied at VA 0x01E11176 (offset 0x{patch_d_offset:x}): Set r0 = 1 in Report 1 handler")
 
     # 4. Put patched app.bin back into JLFS image
     dec[app_addr : app_addr + app_size] = app_bin
@@ -121,6 +153,11 @@ def patch_firmware(ota_input_path: Path, output_zip_path: Path):
     bin_out_path = output_zip_path.parent / "g8" / "ota_mod_touchpad.bin"
     bin_out_path.write_bytes(ota_patched)
     print(f"[+] Written patched binary: {bin_out_path}")
+
+    # Also save raw patched app.bin for inspection / git tracking
+    app_out_path = output_zip_path.parent / "g8" / "app_mod.bin"
+    app_out_path.write_bytes(app_bin)
+    print(f"[+] Written patched app.bin: {app_out_path}")
 
     with zipfile.ZipFile(output_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("ota.bin", ota_patched)
