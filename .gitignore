@@ -1,0 +1,13 @@
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large APK file (extracted assets & dex preserved in dex_files/ and apk_libs/)
+*.apk

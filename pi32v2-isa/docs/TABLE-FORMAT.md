@@ -1,0 +1,193 @@
+# Instruction table format
+
+`isa/pi32v2.toml` is a TOML file with `format = 1` and one `[[insn]]` table per instruction form. An
+instruction form is one encoding with one operand layout: `r1 = r2` and `r1 = [r2]` are different forms.
+
+## Entry
+
+```toml
+[[insn]]
+id = "ld.w.sp"                      # unique and stable; other documents refer to it
+syntax = "{r} = [sp{+n}]"           # JieLi's assembly syntax, see below
+encoding = ["001ooooo00p0rrrr"]     # one string per 16-bit word, see below
+fields = { r = "gpr", n = { kind = "uimm", letters = "po", scale = 4 } }
+group = "memory"                    # optional: a heading for docs/ISA.md
+requires = []                       # CPU features the assembler needs for it, e.g. ["instrev3"]
+decode_requires = []                # optional: features without which JieLi's objdump does not show it
+absent_on = []                      # optional: CPU models whose objdump does not show it, see "CPU models"
+objdump_releases = []               # optional: the only JieLi toolchain releases whose objdump shows it, see "Toolchain releases"
+hw = { ac791n = "resets" }          # optional: what it does on a chip when that is not what the syntax says
+summary = "Load a word from the stack at sp plus 0..252."
+status = "confirmed"                # guessed | documented | confirmed
+sources = ["oracle"]                # ids from docs/SOURCES.md
+notes = "objdump omits the offset when it is 0 ([sp])."   # optional
+asm_no_syntax = false               # optional: no known assembler syntax; all printed texts produce no instruction
+asm_rejects = []                    # optional: texts objdump prints that JieLi's assembler refuses
+asm_wrong = []                      # optional: texts JieLi's assembler is known to mis-assemble
+asm_syntax = ""                     # optional: how the assembler wants the line, if not as objdump prints it
+body = ""                           # optional: a block opener's field that is the body length in bytes
+block = {}                          # optional: an if-block opener's fields implied by its body: { then = "t", else = "e" }
+
+[[insn.example]]                    # optional; zero or more
+bytes = "2d 31"                     # hex, in memory order
+text = "r13 = [sp+196]"             # what the oracle printed and accepted
+origin = "oracle:objdump+clang:20260730.1"
+```
+
+## Naming ids
+
+Ids are lowercase words joined by dots: the operation first, then what distinguishes this form from others
+with the same operation. Follow the existing entries:
+
+| Pattern | Examples |
+| --- | --- |
+| loads and stores: `ld`/`st`, size `w`/`h`/`b`, `u`/`s` for a load's extension, then the addressing | `ld.w`, `st.b`, `ld.bu`, `ld.w.sp` |
+| addressing suffixes: none = register + offset, `.sp` = sp + offset, `.pi` = post-increment by a register (`[r1++=r2]`), `.pin` = post-increment by a number (`[r1++=4]`) | `ld.hu.pi`, `st.w.pin` |
+| arithmetic and logic: `add`, `sub`, `mul`, `and`, `or`, `xor`, `not`, `lsl` (`<<`), `lsr` (`>>`), then operand shape: `.rrr` (`r1 = r2 op r3`), `.rr` (`r1 op= r2`), `.rri` (`r1 = r2 op n`), `.ri` (`r1 op= n`) | `add.rrr`, `xor.ri` |
+| constants and moves: `li.` + range, `mov.` + operands | `li.u8`, `mov.r_sr` |
+| branches: `b` + condition + `z` when against zero, `goto.`/`call.` + reach | `beqz`, `goto.s`, `call.l` |
+| stack: `push.`/`pop.` + what | `push.rl`, `pop.srl` |
+| parallel-issue (`#`) twin of an entry: the entry's id + `.p` | `add.rrr.p` |
+
+When an operation's meaning is not known, name it after what objdump prints (`<<<` is `shl3`, not a guess),
+and say so in `notes`; rename it once the meaning is established. Established so far: `>>>` is `asr`
+(arithmetic shift right) and `>>` is `lsr`, `<>` is `ror` (rotate right), `zcmp(...)` is `sgn`. A name says what the instruction is, never where it was found.
+
+## Encoding strings
+
+- Each string is one 16-bit instruction word, written most significant bit first. Words are listed in
+  memory order. Each word is stored little-endian (low byte first).
+- Characters: `0` and `1` are fixed bits; `-` is a bit the decoder ignores and the assembler writes as `0`;
+  a lowercase letter is a bit of an operand field. With `asm_no_syntax`, `-` describes identical decoded
+  text only: no assembler encoding or equal hardware behavior is implied.
+- Bits with the same letter are read in the order they appear, across words, most significant first.
+
+## Fields
+
+`fields` maps each operand name (a lowercase letter used in `syntax`) to its kind, either as a plain string
+or as an inline table:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `kind` | (required) | an operand kind, below |
+| `letters` | the field's own name | the encoding letters that hold it, most significant part first: `letters = "po"` puts the `p` bits above the `o` bits |
+| `values` | (none) | `enum` only: the text printed for each raw value, a list of exactly 2^width strings |
+| `invert` | false | `modimm` only: print the bitwise complement of the modified immediate |
+| `decimal` | false | `modimm` only: print as an unsigned 32-bit decimal instead of hex |
+| `lead` | (none) | `rmask` only: a name printed first, before the registers (`{rets, r3-r0}`; just `{rets}` when the mask is empty) |
+| `asm_range` | (none) | `uimm`/`simm` only: `[lo, hi]`, the values JieLi's assembler accepts when that is narrower than what the field holds |
+| `zero_as` | (none) | `uimm` only: the number printed for the raw value 0 (a shift amount where 0 means 32) |
+| `scale` | 1 | `uimm`/`simm` only: the printed number is the raw value (sign-extended for `simm`) times `scale`, plus `add` |
+| `add` | 0 | `uimm`/`simm` only |
+
+`scale` may be negative: a one-bit `uimm` with `scale = -8`, `add = 4` is +4 or -4 (`ld.w.pin`).
+
+`letters` handles split fields: `li.u32` keeps a constant's low half in its second word and the high half in
+its third, so its encoding uses `i` then `j` and the field says `letters = "ji"`.
+
+## Syntax
+
+- `{x}` is field `x`.
+- `{+x}` prints `+` and the value, or nothing when the value is 0 (`[sp]`, `[sp+4]`).
+- `{{` and `}}` are literal braces (`[--sp] = {{{l}}}` prints `[--sp] = {r3-r0}`).
+- A block opener (`rep`, `if (...) {`) prints `{` at the end of its line; objdump then prints the body
+  and a `}` line, which take no bytes of their own. When the assembler wants the line differently (`rep r1 {`
+  where objdump prints `rep 4 r1 {`), `asm_syntax` gives its form, and `body` names the field the
+  assembler works out from the body's length. An `if (...) {` opener's shape (how many instructions the
+  then-part and the else-part hold) is in fields that objdump does not print on the opener's line;
+  `block = { then = "t", else = "e" }` names them (a field's value is the part's length in instructions),
+  and they need not appear in `syntax`.
+- The text follows JieLi's **objdump**. The assembler accepts more spellings (`[r1 + 0]`, `b[r4+4]` without
+  `(u)`); an assembler written from this table must accept those too.
+
+## Operand kinds
+
+| Kind | Width | Meaning | Printed as |
+| --- | --- | --- | --- |
+| `gpr` | 4 | `r0`..`r15` | `r5` |
+| `gpr_lo` | 3 | `r0`..`r7` | `r5` |
+| `gpr_hi` | 3 | `r8`..`r15` (field value + 8) | `r13` |
+| `pair` | 3 | 64-bit register pair `r(2n+1)_r(2n)` | `r3_r2` |
+| `pair_regs` | 5 | two names for registers of one 64-bit pair: the pair number (3 bits), then one bit per name saying which register of the pair it is (0 = even, 1 = odd) | `r2,r3`, `r5,r5` |
+| `sr` | 4 | special register by number ([ISA.md](ISA.md) §2) | `reti`, `sr4`, `sp` |
+| `uimm` | any | unsigned number | `252` |
+| `simm` | any | two's-complement number | `-11` |
+| `bit` | 5 | a bit number, printed as the bit's value | `16384` |
+| `invbit` | 5 | a bit number, printed as the 32-bit complement of the bit's value | `4294950911` |
+| `modimm` | 12 | modified immediate: bits 11..10 = 0 repeats byte `XY` as `XY`, `00XY00XY`, `XY00XY00` or `XYXYXYXY` (bits 9..8); otherwise `1` + bits 6..0, rotated right by bits 11..7. Printed in hex | `0x10000` |
+| `enum` | any | one of a fixed set of words or suffixes, chosen by the raw value from the field's `values` list (`".l"`/`".h"`, `"usat"`/`"ssat"`) | `.h` |
+| `rlist4` | 4 | register range: 0..3 is `r3` down to `r<n>`, 4..15 is `r<n>` down to `r4` | `r3, r2`, `r6-r4` |
+| `rmask` | 16 | set of general registers, bit n = `rn` | `r11-r8, r3-r0` |
+| `srmask` | any | set of special registers, bit n = special register n | `psr, rets, reti` |
+
+Register lists are printed highest first; in `rlist4` and `rmask` a run of three or more is written as a
+range. An empty `rmask` or `srmask` prints as nothing (`{}`), which JieLi's assembler refuses: such entries
+list that text in `asm_rejects`.
+
+New kinds are added here and in `pi32v2isa/table.py` and `pi32v2isa/codec.py` together.
+
+## CPU models
+
+JieLi's objdump decodes according to `-mcpu` (one of `r1`..`r5`, `r2v3`, `r3v3`, `r4v3`, `r4v3s`; none is called
+`generic` here) and `-mattr` features. An entry is shown when its CPU model is not in `absent_on` and its
+`decode_requires` features are given, or implied by the model: `r3`, `r4`, `r5`, `r3v3`, `r4v3` and `r4v3s` imply
+`fprev1` (`pi32v2isa.table.CPU_FEATURES`; `table.shown_by_objdump` applies the rule). Measured 2026-10-24 on every
+entry's examples: 642 entries show everywhere; 91 floating-point forms need `fprev1`; 426 are absent on `r1` and
+`r5`; 6 (`copex`, `shiftr ... mode`) are absent without `-mcpu`. On `r1` and `r5` some of those words decode as
+other instructions, which the table does not describe (only `r3`, the FM-1's, was swept).
+
+## Toolchain releases
+
+`objdump_releases` lists the JieLi toolchain releases whose objdump prints a form, when that is not every release
+the table was compared with (`pi32v2isa.table.OBJDUMP_RELEASES`: 20250324.1 and 20260730.1, the current one).
+`table.shown_by_objdump` takes the release (default: the current one), so this repo's objdump leaves such a form
+out unless given `--release=`, and `tools/llvm` leaves it out of the backend. Such an entry is confirmed with
+`oracle confirm --release R`; `check_examples` checks its examples only with that release. The six
+`*.mul2.prhrhrhrhe.b12*` entries are the only ones: 20260730.1's objdump calls them unknown, and both releases'
+assemblers write their text with the bit clear ([hw/fm1-2026-11-14-bit12](../hw/fm1-2026-11-14-bit12/README.md)).
+
+## Hardware behaviour
+
+`hw` records, per chip, a form whose behaviour on real hardware is not what its syntax says, so that tools can
+warn about it and a compiler can leave it out. Keys are chips (`pi32v2isa.table.CHIPS`: `ac791n`, the FM-1's
+AC791N, from the runs under `hw/`); values are
+
+| Value | Meaning |
+| --- | --- |
+| `resets` | executing it resets the chip (every case tried) |
+| `nop` | it changes nothing |
+| `unpredictable` | its result does not follow from its operands (state, or an unknown rule) |
+| `as:<id>` | it does exactly what entry `<id>` does (typically a form one encoding bit away; the notes say which mode) |
+
+The evidence is in the entry's notes and needs the source `hardware`. Forms that work but surprise (flags,
+saturation, NaN results) are not `hw`; their notes describe them. The assembler warns about `hw` forms with
+`--chip ac791n` (and refuses them with `--chip-errors`); objdump notes them with `--chip=ac791n`.
+
+## Status
+
+| Status | Meaning | Needs |
+| --- | --- | --- |
+| `guessed` | Inferred (from a sweep, or by reasoning); not confirmed, no source states it | a `notes` line on how it was inferred |
+| `documented` | A cited source states it | at least one `sources` id other than `oracle` |
+| `confirmed` | Checked against the oracle | `oracle` in `sources` and examples covering every field ([ORACLE.md](ORACLE.md)) |
+
+`confirmed` covers the **encoding and the syntax**: JieLi's tools decode and assemble the entry exactly as the
+table says, allowing equivalent encodings selected by the assembler. With `asm_no_syntax = true`,
+confirmation instead checks decoding and that every probed printed text fails to produce an instruction
+(an assembler error or empty output). Examples then use `oracle:objdump+clang-reject:<release>`. This key
+cannot be combined with `asm_syntax`, `asm_rejects` or `asm_wrong`, and does not establish that no possible
+spelling exists. It says nothing about **behaviour**: the `summary` still rests on the other sources (and `notes`
+says so where it is an assumption) until it is tested on hardware.
+
+## Checks
+
+`python3 -m pi32v2isa check` rejects a table where:
+
+- an `id` repeats, or a required key is missing;
+- an encoding word is not 16 characters, a letter belongs to no field or to two, or a field names a letter
+  the encoding doesn't have;
+- a field's width doesn't fit its kind, or `scale`/`add` is given for a kind other than `uimm`/`simm`;
+- a `{x}` in `syntax` isn't a field, a field never appears in `syntax`, or a brace is unescaped;
+- a `status`, kind or source id is unknown;
+- two entries' encodings overlap (some bit pattern matches both);
+- an example's bytes don't decode to its own entry, or print differently from its `text`.

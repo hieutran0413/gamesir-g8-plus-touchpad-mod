@@ -1,0 +1,252 @@
+# LLVM backend
+
+An LLVM target for pi32v2 (`-triple=pi32v2`), on LLVM 23.1.5, in a fork of llvm-project: branch `pi32v2` of
+[jvitkauskas/pi32v2-llvm](https://github.com/jvitkauskas/pi32v2-llvm), a fork of llvm/llvm-project: the
+target's commits on top of the release tag llvmorg-23.1.5. Its instruction descriptions and assembler tables are generated from this repo's table
+and assembler by `tools/llvm/`, so the table stays the one source. This page says what exists, how it is built
+and how it is checked.
+
+## Status
+
+| Part | State |
+| --- | --- |
+| Triple, ELF machine 241, relocations 0..16 ([ELF.md](ELF.md)) | done |
+| Instructions: 1165 table forms, 4230 LLVM instructions (enum fields expanded) | done, generated |
+| Disassembler, printer (JieLi's objdump syntax) | done: every table example |
+| Code emitter, fixups, branch relaxation, ELF writer | done |
+| Assembler (`llvm-mc`), JieLi's syntax and choices | done: the corpus below |
+| Code generator (`llc`): integers, memory, branches, calls, frames, varargs, tail calls, 64-bit carry and pair multiply | done: the tests below |
+| Hardware float (`-mcpu=r3`, `ac791n`): single precision in the `(f)` forms, `iff` compares, as JieLi's compiler | done |
+| `if (...) {` blocks: selects, and short conditional code (the `PI32V2IfBlocks` pass) | done |
+| Shorter forms, as JieLi's assembler picks them (`MCTargetDesc/PI32V2CompressGen.inc`, push/pop ranges, extensions) | done |
+| `clang`: target info (type sizes, `__PI32V2__`), ABI (aggregates by pointer, sret), driver (`-mcpu`, links with `ld.lld`) | done |
+| `clang`: JieLi's `__builtin_pi32v2_*` (the bit operations as generic IR, the others as the instruction) | done |
+| Runtime: compiler-rt's builtins (soft float, 64-bit multiply/divide), `tools/llvm/build_builtins.sh` | done: all 120 generic sources |
+| Linker (`ld.lld`), relocations as JieLi's `ld` ([LINKER.md](LINKER.md) section 3) | done: the corpus below |
+| Interrupt handlers (`__attribute__((interrupt))`: `psr`, `reti` and the registers used saved, `rti`) | done: on the FM-1 |
+| Atomics: loads, stores, fences inline; read-modify-write as `__sync_*` calls (`tools/llvm/runtime`: interrupts masked, the core lock held) | done |
+| Inline assembly (`r`, `w`/`W`, `d`/`D` constraints), a frame pointer (`r7`) for dynamic stack | done |
+| An FM-1 application from this toolchain alone (`examples/fm1-blink`) | done: on the FM-1 |
+| m-bootloader 1.2 (FM-1, SMK-37) and fm1-base's template from this toolchain alone | done: on the hardware (`hw/fm1-2026-10-25-open-firmware`) |
+| `llvm-objdump` branch targets as symbols | done: agrees with JieLi's objdump on every form it annotates (all but `ifs2ns`) |
+| `byval` (a struct argument as JieLi's clang writes it: a pointer to the caller's copy) | done |
+| Parallel issue: `A #` and a short load or store as one packet, instructions moved to make pairs (`PI32V2Packetize`) | done: Snoop37 2.7.2 built with it runs on the SMK-37 Pro |
+| JieLi's bitcode (LLVM 4.0.1: the AC79 SDK's libraries), compiled by `llc` or `ld.lld`'s LTO (below) | done: 4898 of the SDK's 4900 objects; JieLi's compiler rejects the other two |
+| 64-bit atomics | not yet |
+
+## Building
+
+```sh
+git clone --branch pi32v2 https://github.com/jvitkauskas/pi32v2-llvm.git LLVM
+python3 tools/llvm/gen_td.py LLVM/llvm/lib/Target/PI32V2 --tests LLVM/llvm/test/MC   # after a table change
+cmake -G Ninja LLVM/llvm -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=ON \
+      -DLLVM_TARGETS_TO_BUILD="" -DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=PI32V2
+ninja llvm-mc llvm-objdump llvm-readobj llc   # add -DLLVM_ENABLE_PROJECTS="clang;lld" for clang and ld.lld
+```
+
+The generated files are committed in the LLVM tree, each with a header naming the generator: `PI32V2InstrGen.td`
+(operands and instructions), `PI32V2OperandsGen.inc` (their decoders, encoders and printers),
+`AsmParser/PI32V2ParserGen.inc` (the assembler's templates), `MCTargetDesc/PI32V2FixupsGen.inc` (where an
+expression goes in each instruction), `MCTargetDesc/PI32V2RelaxGen.inc` (branch relaxation) and
+`AsmParser/PI32V2HwGen.inc` (the forms a chip's hardware runs differently, the table's `hw` key, which the assembler
+warns about with that chip as the CPU: `-mcpu=ac791n`). Regenerate them
+after any change to `isa/pi32v2.toml` or `pi32v2isa/asm.py`.
+
+## How the table maps to LLVM
+
+- **Instructions.** One TableGen instruction per form and combination of `enum` values (the value's text is part
+  of the assembly string, its bits fixed). The encoding is `Inst` of 16, 32 or 48 bits, the first word in the
+  high bits; the emitter writes the words in order, each little-endian. A `-` bit is left unset.
+- **Operands.** `gpr`, `gpr_lo`, `gpr_hi`, `pair` and `sr` are register classes; every other field is an
+  immediate operand holding the value the syntax shows (scaled, a bit's value, a modified immediate's 32 bits),
+  register lists their raw field. A form whose syntax starts `{x} =` defines x; `{x} op= ...` reads and writes
+  it (a tied operand). That is what the syntax says, not a semantics; the code generator adds what it needs.
+- **Assembler.** JieLi's syntax has no mnemonic first, and an operand can only be found by knowing the form
+  (`[--sp]` is not an expression). So the parser does what `pi32v2isa/asm.py` does: the line in canonical form,
+  matched against one template per way of writing each form (its aliases included), the readings that fit
+  sorted as `asm.py` sorts them (size, alias, tie, table order). The templates are generated from `asm.py`'s
+  matchers, so both assemblers accept the same lines. Expressions follow `asm.py`'s grammar.
+- **Branches** start in their smallest form and grow by relaxation to the next form that matches the same line,
+  until the target is in reach or the form has a relocation. A branch to any non-weak label of the same section
+  (global or not, an alias of one too) is resolved by the assembler, as JieLi's is.
+- **Calls between functions** are therefore 2 bytes only within one section: the 2-byte call has no relocation,
+  and the linker does not shrink calls. The fork's `ld.lld` generates LTO code without function sections: the
+  functions share `.text`, except those that may be dead (library functions LTO keeps for code generation that
+  nothing in the program uses, such as `__udivsi3` or an unused `memmove`, and local functions only they use),
+  which keep a section each for `--gc-sections`. `-Wl,-mllvm,-pi32v2-shared-text=false` gives every function its
+  section again. m-bootloader 1.2: 53 more 2-byte calls on the SMK-37.
+- **Blocks.** `rep ... {` takes its body's length in bytes from labels around the body; `if (...) {` takes the
+  instruction counts of its two parts from symbols set at the closing `}`. Both are resolved by the assembler.
+
+## Checks
+
+```sh
+python3 tools/llvm/check_mc.py BUILD/bin     # every example: disassembly, re-encoding, assembly
+python3 tools/llvm/check_objs.py BUILD/bin   # objects of tests/asm and of the C corpus (JieLi's clang -S)
+llvm-lit LLVM/llvm/test/MC/PI32V2 LLVM/llvm/test/MC/Disassembler/PI32V2
+```
+
+As of 2026-10-25: all 6093 examples disassemble to their text and re-encode to their bytes; all 5478 assemble
+to `asm.py`'s bytes; `llvm-mc`'s objects have the same sections, contents, relocations and symbol values as
+`asm.py`'s (which are JieLi's, [ELF.md](ELF.md)) for 179 of 180 files: `tests/asm/*.s` and the 50 C files of
+`tests/corpus` at -O0, -O2 and -Os. The one difference is `tests/asm/secnames.s`: for section names such as
+`.data.rel` and `.eh_frame` without flags, LLVM's generic ELF parser gives other default flags than JieLi's.
+
+## Known differences from JieLi's assembler
+
+- Default flags of sections named without flags (above).
+- `@` relocation variants (`sym@PI32V2GOT`) are not parsed yet.
+- The object layout (section and symbol order, string table) is LLVM's; the checks compare contents, not layout.
+- `--chip ac791n` warnings (the table's `hw` key) are not given yet; the feature `ac791n` exists for them.
+
+## The code generator
+
+It follows JieLi's C convention ([ABI.md](ABI.md)): arguments are words of one stream, `r0`..`r3` and then at
+`sp`; results in `r0` and `r1`; `r4`..`r15` preserved. A frame is what JieLi's compiler makes: one push of `rets`
+and the saved registers (`[--sp] = {rets, r15-r4}`), `sp += -n`, and the matching pop into `pc`, which returns; a
+function that saves nothing returns with `rts`. Stack slots use the `[sp+n]` forms. A variadic function first
+pushes the argument registers its named arguments left unused, so they continue the stack arguments. Clang passes
+every aggregate as a pointer to a copy and returns one through a hidden pointer in `r0`; a `byval` argument (what
+JieLi's clang writes for a struct) is that pointer, to a copy the caller makes in its own frame. The stack is
+word-aligned and never realigned: 64-bit variables are word-aligned, as JieLi's compiler has them, and a local
+that needs more (`aligned(16)`) gets room for its alignment and its address rounded up (`PI32V2AlignAllocas`),
+as JieLi's compiler does.
+
+## JieLi's bitcode
+
+The AC79 SDK's libraries are LLVM bitcode from JieLi's clang (LLVM 4.0.1), which ld.lld's LTO compiles when
+they are linked. This LLVM reads it; on loading, three things are upgraded:
+
+- **Inlined loops' locations.** LLVM 4 left an inlined loop's `llvm.loop` start and end locations in the inlined
+  function, which the verifier rejects: such a loop gets loop metadata of its own with its branch's location
+  (134 of the SDK's objects; no other debug information is wrong).
+- **The data layout** lacks the stack alignment; `-S32` is added.
+- **JieLi's intrinsics.** Its clang writes `__builtin_pi32v2_<name>` as `llvm.pi32v2.<name>` (the 18 builtins of
+  [COMPILER.md](COMPILER.md) section 3), and its optimizer forms `llvm.pi32v2.shfms64(x, n)` from a 64-bit value
+  shifted right to 32 bits (the `r = rp >> n (s)` forms, `lsr.s.rpi`/`lsr.s.rpr`). Calls become what clang emits
+  for the builtins. A call to any other `llvm.*` function that is no intrinsic stops code generation.
+- **`"allow-nullptr-deref"`**, JieLi's `-fallow-pointer-null` (the SDK's libraries are built with it), becomes
+  `null_pointer_is_valid`: address 0 is memory on these chips.
+
+Its interrupt handlers carry the same `"interrupt"` attribute as clang's; its inline assembly uses JieLi's
+constraints (`w`, `W`, `d`, `D`) and spellings the assembler accepts as aliases
+([audits/2026-10-sdk-inline-asm.md](audits/2026-10-sdk-inline-asm.md)). Where code written for JieLi's toolchain
+relies on what its older LLVM does, the target does the same:
+
+- **`-pi32v2-large-program`** (the SDK passes it to the compiler and to the linker's LTO): a call the assembler
+  leaves to the linker is the 6-byte `call.xl`, which reaches RAM code from flash; no call is a tail call.
+- **No `calloc` is formed.** A malloc and a memset of it are not folded into a `calloc` call: firmware has its
+  own allocator, and one whose `calloc` is that zalloc (fm1-base's) would call itself.
+- **`__attribute__((used))`** keeps a global from the compiler, not from `--gc-sections` (no `SHF_GNU_RETAIN`):
+  the SDK's BT libraries register handlers in tables of their own sections that a linker script need not place.
+- **A missing return gives a value.** A function that falls off its end returns undef, and a branch on undef is
+  undefined behaviour to today's optimizer; JieLi's left the code alone, and the SDK relies on it (its Wi-Fi
+  libraries' `wf_mem_init`, whose status the driver's probe tests). `PI32V2FreezeReturns` freezes such an undef
+  before interprocedural constant propagation sees it, in the normal and in the LTO pipeline.
+- **`__attribute__((always_inline_when_const_args))`** (JieLi's; IR `"always-inline-when-const-args"`): inlined at
+  every call whose arguments are all constants, a global's address too. The SDK's `Init_LwIP` switches on its
+  argument to names a configuration need not define.
+- **Inline assembly** keeps `{`, `|` and `}` as written (they are pi32v2's block braces; `NoAsmVariants`), and
+  `-fprefer-gnu-section` lets a function's section attribute win over `#pragma code_seg`, as in JieLi's clang.
+- **LTO's sections**: one `.text` (see above) and the data in `.data`, `.bss` and `.rodata`, as the SDK's linker
+  scripts place them.
+
+As of 2026-10-26, `ld.lld -r` compiles 4898 of the SDK's 4900 bitcode objects; JieLi's compiler rejects the
+other two as well (their inline assembly, [GAPS.md](GAPS.md)). fm1-base's
+Bluetooth build (the SDK's BT libraries LTO-linked) and all 14 applications of the SDK V1.2.14 build with this
+toolchain alone, through the drop-in package ([DROPIN.md](DROPIN.md#code-size-against-jielis-toolchain-2026-10-29):
+its code is 4.6 % smaller than JieLi's over 13 open firmwares); fm1-base's plays MIDI over Bluetooth on the FM-1 with an
+iPhone ([hw run](../hw/fm1-2026-10-27-dropin-ble/README.md)), the applications have not run on hardware.
+
+The code generator uses the general forms of the table (`tools/llvm/codegen_flags.py` says which, and what LLVM
+must know about them: loads, stores, branches, calls, `psr`); the emitter then puts each in the shortest form
+JieLi's assembler would choose for its line. Branches start short and grow by relaxation.
+
+## Testing compiled code
+
+- `tools/llvm/sim.py`: a simulator whose instructions are the models fitted to the FM-1 (`tools/hwtest/semantics`,
+  which agree with every hardware result in `hw/`); control flow is its own, parallel pairs follow the hardware's
+  rules, library helpers are done in Python.
+- `tools/llvm/cgtest.py`: 255 calls of functions in LLVM IR (`cgtest.ll`), compiled by `llc`, with results computed
+  in Python; `build` makes a test application for the FM-1 (`tools/hwtest/app/cgdriver.S`), `check` compares its
+  results. `sim.py OUTDIR` runs the same calls in the simulator: all 255 agree (2026-10-25).
+- `tools/llvm/ctest.py`: `ctest.c` compiled by JieLi's clang and by ours (both `-mcpu=r3`), both run in the
+  simulator on the same inputs, the results compared (integer, 64-bit, float and double code, atomics, tail
+  calls, the single-instruction idioms and builtins; the LLVM build linked with the builtins above and
+  `libpi32v2.a`, JieLi's with the helpers done in Python). As of 2026-10-25 they agree on all 2368 calls at -O0,
+  -O1, -O2 and -Os. The test found one code generator bug: the popping return did not keep the result registers live.
+  `--jieli-ir` compiles JieLi's bitcode of `ctest.c` with `ld.lld -r` (LTO) instead, as an SDK library is compiled;
+  it found the missing intrinsic upgrade and a stack alignment bug (an 8-aligned local assumed at a word-aligned
+  address, in compiler-rt's `__moddi3`).
+- `ld.lld` and this repo's linker (which matches JieLi's, [LINKER.md](LINKER.md)) give the same loaded bytes for 97
+  of 100 links of the corpus compiled by JieLi's clang; the other three differ in where they place an orphan
+  section or merged constants, not in relocations. The test application built with clang, its integrated
+  assembler and `ld.lld` alone is byte-identical to the one built with this repo's assembler and linker.
+- On the FM-1: the IR test (255/255, `hw/fm1-2026-10-25-cgtest`), `ctest.c` (960/960, `hw/fm1-2026-10-25-ctest`;
+  after the code-size work with hardware float, 1140/1140 at -O2 and at -Os, `hw/fm1-2026-10-25-ctest2`) and
+  `examples/fm1-blink`, a timer interrupt handled in C at 100 Hz (`hw/fm1-2026-10-25-blink`).
+
+## The runtime
+
+`tools/llvm/build_builtins.sh BIN LLVM OUT` builds `libclang_rt.builtins-pi32v2.a` (compiler-rt's generic builtins)
+and `libpi32v2.a` from `tools/llvm/runtime`: the `__sync_*` functions of 1, 2 and 4 bytes. Each runs with this
+core's interrupts masked (`cli`/`sti` of the previous state) and holding the shared core lock (`lockset`, csync,
+the access, csync, `lockclr`), which excludes the other core (hw/fm1-2026-10-24-app4: two cores' 1000 locked
+increments each gave 2000), as the AC79 SDK's critical sections take it. The lock is taken once per call, never
+nested (its recursion is not known). The compiler passes an operand narrower than a word without extending it, so
+each function uses only the low bytes of its operands. Aligned loads and stores of up to a word are single accesses, fences
+`csync`. The two-core use of the runtime itself has not been run on the FM-1 yet.
+
+## Code size
+
+`tools/llvm/sizes.py LLVM_BIN [--opt s]` compiles `ctest.c` and `tests/corpus/*.c` with both compilers (JieLi's with
+`-mcpu=r3`, ours with the same) and compares every function's size. As of 2026-10-25, over 909 functions, the LLVM
+target's code is 0.5% larger than JieLi's at -Os (12602 bytes against 12542) and 0.6% smaller at -O2 (13584
+against 13670). It was 40% larger before; what closed the gap, in order of bytes:
+
+- the 16-bit push/pop range forms and `sp += n` in its short form (both were rules the compression lacked);
+- tail calls (`goto f` after the epilogue) and the hardware float of `-mcpu=r3`;
+- compare-with-constant branches, branches compressed to their short forms (relaxation grows them), `if` blocks
+  for selects and short conditional code;
+- the carry chain (`addc`/`subc`) and the pair multiply for 64-bit arithmetic, bit-field extracts and the
+  `.b0`/`.l` extensions, `clz`/`cls`/`rev8`/rotates/min/max, indexed addressing, multiply by a constant;
+- a division by a constant stays a division when optimizing for size (JieLi's compiler always divides);
+- `memcpy` inlined only as wide as both ends' alignment allows (a misaligned copy is a call).
+
+Left: 64-bit compares through the flags (`sub; subc; psr`), pair shifts and rotates, post-increment loads and
+stores, memory read-modify-write forms (`[r+n] |= r`), SIMD byte lanes. `__builtin_pi32v2_popcount` is computed in
+software on purpose: the AC791N runs `popcnt` as a nop.
+
+## Speed
+
+Measured on an SMK-37 Pro, with the code where its firmware runs it: Ripple's 28 audio "currents" (Faust, C and
+C++ DSP modules of [fm1-ripple](https://github.com/charlesvestal/fm1-ripple)) loaded into SRAM by a benchmark
+application started by m-bootloader, each one's `process` timed over 256-frame blocks with TIMER4 (the 24 MHz
+crystal). The output of every current is the same with both compilers. Against JieLi's compiler, in total:
+release `pi32v2-23.1.5-2` 2.7% slower, `pi32v2-23.1.5-3` 5.1% faster, `pi32v2-23.1.5-4` 9.1% faster (up to 28% on
+single currents; macro-string is still 6.2% slower, see below). What made the difference:
+
+- parallel issue: an instruction with a `#` twin and the 16-bit load or store after it go as one packet
+  ([COMPILER.md](COMPILER.md)), and the last pass moves an independent instruction next to a load or store to make
+  one. Worth about 4% on the device (the twin is the same size: code size does not change). Not when minimizing
+  size (`-Oz`, 23.1.5-5): code with the twins compresses worse (m-bootloader's packed stage 1: 80-100 bytes);
+- for functions not optimized for size: the DAG scheduled in source order (the ILP scheduler started values early
+  and loops spilled them), no post-incremented pointer per array from the loop optimizer, 32-bit constants made
+  again where they are used instead of spilled;
+- selects whose two values commute (the inverse condition), so a loop's running maximum keeps its register;
+- (23.1.5-4) for functions not optimized for size: the machine scheduler, top-down in a region that sets up a call's
+  arguments (bottom-up kept a stack argument in a register that then had to be saved), and `li.modimm` constants
+  made again instead of reloaded (a reload is 2 cycles, the constant 1).
+
+Instruction costs measured in the chip's download mode (code and data in SRAM, the ROM's clock): ALU 1 cycle, load 2,
+store 1.5, float add and multiply 2 (not pipelined), float divide 4, integer multiply 3, a taken branch 7.5 to 10, an
+untaken one 1, an `if (...) {` block about 2. Pair and multi-register accesses (`d[...]`, `{r, r} = [r+]`) take as
+long as the single ones: JieLi's compiler uses them for size, they are no faster. A simulator count of
+instructions (`tools/llvm/sim.py`) is not a measure of speed: it counted such a pair as one, and it does not see
+the clock, the flash and the cache.
+
+macro-string's remaining difference is in plaits' `String::ProcessInternal`: each sample picks the random
+generator's state by the core it runs on (`stmlib::Random`, `plaits_core_sp`), an `extern` array whose size LLVM
+does not assume from its declaration, so a store through `this` may change it and the choice is made again every
+sample. JieLi's compiler (LLVM 4) moves it out of the loop. Taking the state once a block in the source (a reference
+to `Random::state_ref()` before the loop) makes both compilers' builds equally fast.
